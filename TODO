@@ -1,0 +1,11 @@
+* better text handling (including text filters, probably restructure data)
+* support for multi-page sorting (using disk sort type method, should remain low-memory)
+* faster and lower memory imports (and support for csv and pq)
+* support for count(*), distinct, top, etc
+* columns with (), other special characters
+* proper query planner and join handling
+* database cracking (need to decide if planner should dig through each page to see what is useful vs on-the-fly cracking during opcode execution)
+* text filters (e.g. ticker == 'SPY')
+* group by (having)
+* transactions, inserts, etc
+
