@@ -24,7 +24,9 @@ def t_WHITESPACE(t):
     r'[ \t]+'
     pass
 def t_IDENTIFIER(t):
-    r'[A-Za-z][A-Za-z0-9_]*'
+    r'([A-Za-z][A-Za-z0-9_]*|`(?:\\.|[^`\\])*`)'
+    if t.value.startswith('`'):
+        t.value = t.value[1:-1]
     if t.value.upper() in keywords:
         t.type = t.value.upper()
     return t
@@ -184,7 +186,7 @@ def p_from_next(p):
 
 
 def p_join_clause_on(p):
-    'join_clause : join_operator ON expression'
+    'join_clause : join_operator table_or_subquery ON expression_list'
     p[0] = ('on',p[1],p[3])
 
 def p_join_clause_using(p):
@@ -192,7 +194,7 @@ def p_join_clause_using(p):
     p[0] = ('using',p[1],p[4])
 
 def p_join_clause_next(p):
-    'join_clause : join_operator'
+    'join_clause : join_operator table_or_subquery'
     p[0] = p[1]
 
 
@@ -252,12 +254,20 @@ def p_column_names_first(p):
     p[0] = [p[1]]
 
 
-def p_table_or_subquery_call(p): # TODO add arguments (expression list or blank), add as ...
-    'table_or_subquery : table_or_function OPEN_PAREN CLOSE_PAREN'
-    p[0] = (p[1],)
+#def p_table_or_subquery_call(p): # TODO add arguments (expression list or blank), add as ...
+#    'table_or_subquery : table_or_function OPEN_PAREN CLOSE_PAREN'
+#    p[0] = (p[1],)
+#
+#def p_table_or_subquery_call_star(p):
+#    'table_or_subquery : table_or_function OPEN_PAREN ASTERISK CLOSE_PAREN'
+#    p[0] = (p[1], ['*'])
 
 def p_table_or_subquery_next(p):
     'table_or_subquery : table_or_function'
+    p[0] = p[1]
+
+def p_table_or_subquery_int(p):
+    'table_or_subquery : INTEGER'
     p[0] = p[1]
 
 def p_table_or_subquery_id(p):
@@ -573,13 +583,19 @@ def p_expr_core_id(p):
     'expr_core : IDENTIFIER'
     p[0] = p[1]
 
-#def p_expr_core_func(p): # function -- TODO add expression list options.. and optional distinct
-#    'expr_core : IDENTIFIER OPEN_PAREN CLOSE_PAREN'
-#    p[0] = (p[1],)
+# TODO TOP, DISTINCT, etc
+def p_expr_core_func(p):
+    'expr_core : IDENTIFIER OPEN_PAREN CLOSE_PAREN'
+    p[0] = (p[1],)
 
-#def p_expr_core_func_star(p):
-#    'expr_core : IDENTIFIER OPEN_PAREN ASTERISK CLOSE_PAREN'
-#    p[0] = (p[1],'*')
+def p_expr_core_func_star(p):
+    'expr_core : IDENTIFIER OPEN_PAREN ASTERISK CLOSE_PAREN'
+    p[0] = (p[1],'*')
+
+def p_expr_core_func_list(p):
+    'expr_core : IDENTIFIER OPEN_PAREN expression_list CLOSE_PAREN'
+    p[0] = (p[1],p[3])
+
 
 def p_expr_core_exprlist(p):
     'expr_core : OPEN_PAREN expression_list CLOSE_PAREN'
@@ -654,7 +670,7 @@ def _sql(text):
 if __name__ == '__main__':
     import time
     s = time.time()
-    #pt = _sql('select test,* from magic left join partial on l=r where a=:a group by xyz order by other')
-    pt = _sql('select test.* from magic where a=:a group by xyz order by other')
+    #pt = _sql('select count(*), test,* from magic left join partial on l=r where a=:a group by xyz order by other')
+    pt = _sql('select count(*), test.* from magic where a=:a group by xyz order by other')
     print('time',time.time()-s)
     print(pt)

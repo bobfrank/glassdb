@@ -6,12 +6,17 @@ import struct
 import io
 
 type_order = [np.uint8, np.uint16, np.uint32, np.uint64, np.int8, np.int16, np.int32, np.int64, np.float32, np.float64, 'text', 'dir','file','meta']
+type_names = ['u8','u16','u32','u64','i8','i16','i32','i64','f32','f64','text']
 
 class TextVec(object):
+
+    dtype = 'text'
+
     def __init__(self):
         self.blob = b''
         self.starts = np.array([], dtype=np.uint32)
         self.ends = np.array([], dtype=np.uint32)
+        self.text_to_start = {}
 
     def tobytes(self):
         return struct.pack('!I', len(self.starts)) + self.starts.tobytes() + self.ends.tobytes() + self.blob
@@ -21,17 +26,22 @@ class TextVec(object):
         nstrs = struct.unpack('!I', buf[:4])[0]
         result = TextVec()
         # saving starts and ends just for filtering to subsets of rows quicker (e.g. by reusing blob and not calculating strlen ever)
+        #print(buf[:100])
+        #print(len(buf), nstrs, nstrs*4)
         result.starts = np.frombuffer(buf[4:4+4*nstrs], dtype=np.uint32)
         result.ends = np.frombuffer(buf[4+4*nstrs:4+8*nstrs], dtype=np.uint32)
         result.blob = buf[4+8*nstrs:]
+        result.text_to_start = None
         return result
 
     def tolist(self):
         return [self.blob[self.starts[i]:self.ends[i]] for i in range(len(self.starts))]
 
-    @property
-    def dtype(self):
-        return 'text'
+    def setup_text_to_start(self):
+        self.text_to_start = {}
+        start_ends = set(zip(self.starts,self.ends))
+        for start, end in start_ends:
+            self.text_to_start[ self.blob[start:end] ] = start
 
     def __len__(self):
         return len(self.starts)
@@ -42,13 +52,52 @@ class TextVec(object):
         else:
             return str([self[i] for i in range(5)] + ['...'] + list(reversed([self[-i] for i in range(5)]))).replace(" '...'", ' ...')
 
+    def __eq__(self, rhs):
+        if self.text_to_start is None:
+            self.setup_text_to_start()
+        idx = self.text_to_start.get(rhs)
+        if idx is None:
+            return False
+        else:
+            return self.starts == idx
+
+    def __neq__(self, rhs):
+        if self.text_to_start is None:
+            self.setup_text_to_start()
+        idx = self.text_to_start.get(rhs)
+        if idx is None:
+            return False
+        else:
+            return self.starts != idx
+
+# TODO
+#    def orderby_order(self):
+#        return np.array(sorted(range(len(y)),key=y.__getitem__))
+
+    def groupby_order(self):
+        return np.argsort(self.starts)
+
+    def groupby_starts(self):
+        prev = np.roll(self.starts,1)
+        prev[0] = -1
+        return self.starts != prev
+
     @staticmethod
     def fromlist(ls):
+        blob_items = []
+        offset = 0
+        unique_texts = list(set(ls))
+        text_to_start = dict((a,b) for (b,a) in enumerate(unique_texts))
+        indexes = np.array([text_to_start[t] for t in ls])
+        ends = np.array(np.cumsum(np.array(list(map(len,unique_texts)), dtype=np.uint32)), dtype=np.uint32)
+        starts = np.array(np.roll(ends, 1), dtype=np.uint32)
+        starts[0] = 0
+        blob = b''.join(unique_texts)
         result = TextVec()
-        result.ends = np.array(np.cumsum(np.array(list(map(len,ls)), dtype=np.uint32)), dtype=np.uint32)
-        result.starts = np.array(np.roll(result.ends, 1), dtype=np.uint32)
-        result.starts[0] = 0
-        result.blob = b''.join(ls)
+        result.blob = blob
+        result.starts = starts[indexes]
+        result.ends = ends[indexes]
+        result.text_to_start = text_to_start
         return result
 
     def __getitem__(self, index):
@@ -61,10 +110,11 @@ class TextVec(object):
             result.starts = self.starts[index]
             result.ends = self.ends[index]
             result.blob = self.blob
+            result.text_to_start = self.text_to_start
             return result
 
 
-dir_max_entries = 128
+dir_max_entries = 32
 dir_max_name_len = 64
 
 def directory_size():
@@ -100,8 +150,6 @@ def serialize_directory(directory):
     return names_data + offsets_data + sizes_data + types_data
 
 def deserialize_directory(buf):
-    dir_max_entries = 128
-    dir_max_name_len = 64
     names = [buf[i*dir_max_name_len:(i+1)*dir_max_name_len].rstrip(b'\0') for i in range(dir_max_entries)]
     off = dir_max_entries*dir_max_name_len
     offsets_size = 8*dir_max_entries
@@ -171,13 +219,39 @@ def malloc(fp, size):
 def add_dir_entry(fp, parent_directory_offset, name, offset, size, type_index):
     fp.seek(parent_directory_offset)
     parent_rec = deserialize_directory(fp.read(directory_size()))
-    # TODO if we are too big, create a '.' entry and point to that..
-    parent_rec['names'].append(name)
-    parent_rec['offsets'] = np.append(parent_rec['offsets'], np.array([offset], dtype=np.uint64))
-    parent_rec['sizes'] = np.append(parent_rec['sizes'], np.array([size], dtype=np.uint32))
-    parent_rec['types'] = np.append(parent_rec['types'], np.array([type_index], dtype=np.uint32))
-    fp.seek(parent_directory_offset)
-    fp.write(serialize_directory(parent_rec))
+    if len(parent_rec['names']) == dir_max_entries:
+        if parent_rec['names'][-1] == b'.':
+            next_parent_directory_offset = parent_rec['offsets'][-1]
+            res = add_dir_entry(fp, next_parent_directory_offset, name, offset, size, type_index)
+            if res is not None:
+                return res
+            else:
+                return next_parent_directory_offset
+
+    elif len(parent_rec['names']) >= dir_max_entries-1:
+        new_parent_rec = empty_directory()
+        new_parent_directory_offset = malloc(fp, directory_size())
+        fp.seek(new_parent_directory_offset)
+        fp.write(serialize_directory(new_parent_rec))
+
+        parent_rec['names'].append(b'.')
+        parent_rec['offsets'] = np.append(parent_rec['offsets'], np.array([new_parent_directory_offset], dtype=np.uint64))
+        parent_rec['sizes'] = np.append(parent_rec['sizes'], np.array([directory_size()], dtype=np.uint32))
+        parent_rec['types'] = np.append(parent_rec['types'], np.array([type_order.index('dir')], dtype=np.uint32))
+        #print('adding',parent_rec['names'], parent_directory_offset)
+        fp.seek(parent_directory_offset)
+        fp.write(serialize_directory(parent_rec))
+        add_dir_entry(fp, new_parent_directory_offset, name, offset, size, type_index)
+        return new_parent_directory_offset
+
+    else:
+        parent_rec['names'].append(name)
+        parent_rec['offsets'] = np.append(parent_rec['offsets'], np.array([offset], dtype=np.uint64))
+        parent_rec['sizes'] = np.append(parent_rec['sizes'], np.array([size], dtype=np.uint32))
+        parent_rec['types'] = np.append(parent_rec['types'], np.array([type_index], dtype=np.uint32))
+        fp.seek(parent_directory_offset)
+        fp.write(serialize_directory(parent_rec))
+        return parent_directory_offset
 
 def empty_directory():
     return {
@@ -194,8 +268,8 @@ def mkdir(fp, parent_directory_offset, name, rec=None):
     new_offset = malloc(fp, directory_size())
     fp.seek(new_offset)
     fp.write(serialize_directory(rec))
-    add_dir_entry(fp, parent_directory_offset, name, new_offset, directory_size(), type_order.index('dir'))
-    return new_offset
+    res = add_dir_entry(fp, parent_directory_offset, name, new_offset, directory_size(), type_order.index('dir'))
+    return new_offset, res
 
 def mkdir_p(fp, path, rec=None):
     offset = 0
@@ -205,7 +279,7 @@ def mkdir_p(fp, path, rec=None):
     for i, part in enumerate(parts):
         if part not in dir_rec['names']:
             for part_hat in parts[i:]:
-                offset = mkdir(fp, offset, part_hat)
+                offset, _ = mkdir(fp, offset, part_hat)
             return offset
         rec_i = dir_rec['names'].index(part)
         offset = dir_rec['offsets'][rec_i]
@@ -227,13 +301,23 @@ def insert_vector(fp, parent_directory_offset, name, values):
 
 cached_dir_records = {}
 
+def read_directory_all(fp, file_offset):
+    fp.seek(file_offset)
+    dir_rec = deserialize_directory(fp.read(directory_size()))
+    if dir_rec['names'] and dir_rec['names'][-1] == b'.':
+        next_dir_rec = read_directory_all(fp, dir_rec['offsets'][-1])
+        dir_rec['names'] = dir_rec['names'][:-1] + next_dir_rec['names']
+        dir_rec['offsets'] = np.concatenate((dir_rec['offsets'][:-1], next_dir_rec['offsets']))
+        dir_rec['sizes'] = np.concatenate((dir_rec['sizes'][:-1], next_dir_rec['sizes']))
+        dir_rec['types'] = np.concatenate((dir_rec['types'][:-1], next_dir_rec['types']))
+    return dir_rec
+
 def read_path(fp, path):
-    fp.seek(0)
     # TODO so long as we have it cached we must mark it as read-locked
     if () in cached_dir_records:
         dir_rec = cached_dir_records[()]
     else:
-        dir_rec = deserialize_directory(fp.read(directory_size()))
+        dir_rec = read_directory_all(fp, 0)
         cached_dir_records[()] = dir_rec
     if path == b'':
         return dir_rec
@@ -243,102 +327,27 @@ def read_path(fp, path):
             dir_rec = cached_dir_records[tuple(parts[:i+1])]
         else:
             rec_i = dir_rec['names'].index(part)
-            fp.seek(dir_rec['offsets'][rec_i])
-            rec_data = fp.read(dir_rec['sizes'][rec_i])
+            offset = dir_rec['offsets'][rec_i]
             if dir_rec['types'][rec_i] == type_order.index('dir'):
-                dir_rec = deserialize_directory(rec_data)
+                dir_rec = read_directory_all(fp, offset)
+                #print('looking at',b'/'.join(parts[:i+1]), dir_rec['names'])
                 cached_dir_records[tuple(parts[:i+1])] = dir_rec
             else:
+                fp.seek(offset)
+                rec_data = fp.read(dir_rec['sizes'][rec_i])
                 if i != len(parts)-1:
                     raise RuntimeError('{} is not a directory'.format(part))
-                res = deserialize_vector(rec_data, dir_rec['types'][rec_i])
-                return res
+                return deserialize_vector(rec_data, dir_rec['types'][rec_i])
     return dir_rec
 
 def open_dir(fp, parent_directory_offset, name):
-    fp.seek(parent_directory_offset)
-    dir_rec = deserialize_directory(fp.read(directory_size()))
-    rec_i = dir_rec['names'].index(name)
-    if dir_rec['types'][rec_i] == type_order.index('dir'):
-        return dir_rec['offsets'][rec_i]
+    dir_rec = read_directory_all(fp, parent_directory_offset)
+    if name not in dir_rec['names'] and b'.' in dir_rec['names']:
+        return open_dir(fp, dir_rec['offsets'][dir_rec['names'].index(b'.')], name)
     else:
-        raise RuntimeError('{} is not a directory'.format(name))
-
-def create_table(fp, table_name, col_names):
-    table_offset = mkdir(fp, 0, table_name)
-    for col in col_names:
-        mkdir(fp, table_offset, col)
-    return table_offset
-
-def insert_table_page(fp, table_name, page_index, table_page, seed=1987):
-    gen = np.random.default_rng(seed=seed) # all db operations must be replicatable, so we need to pass a seed to build our sample for estimating percentiles
-    table_offset = open_dir(fp, 0, table_name)
-    for col, vals in table_page.items():
-        col_offset = open_dir(fp, table_offset, col)
-        page_offset = mkdir(fp, col_offset, struct.pack('!I', page_index) + b'pg')
-        values_offset = insert_vector(fp, page_offset, b'vals', vals)
-        if len(vals) >= 100000:
-            idx_offset = mkdir(fp, page_offset, b'idx')
-            values_sample = gen.choice(vals, 10000)
-            if isinstance(vals, TextVec):
-                sorted_values_sample = np.sort(values_sample)
-                idx = np.array(np.arange(0,100)*len(values_sample)/100, dtype=np.uint32)
-                percentile_estimates = TextVec.fromlist( sorted_values_sample[idx] )
-            else:
-                percentile_estimates = np.percentile(values_sample, np.arange(0,100))
-            pct_offset = insert_vector(fp, idx_offset, b'pct', percentile_estimates)
-
-#fd = os.open(lockfile, os.O_WRONLY|os.O_NOCTTY|os.O_CREAT, 0o666)
-#if sys.platform.startswith('aix'):
-#  # Python on AIX is compiled with LARGEFILE support, which changes the
-#  # struct size.
-#  op = struct.pack('hhIllqq', fcntl.F_WRLCK, 0, 0, 0, 0, 0, 0)
-#else:
-#  op = struct.pack('hhllhhl', fcntl.F_WRLCK, 0, 0, 0, 0, 0, 0)
-#fcntl.fcntl(fd, fcntl.F_SETLK, op)
-
-def main():
-    from sql import _sql
-    print(_sql("SELECT ticker,date,close FROM prices WHERE date>=:date"))
-    s = time.time()
-    with open('strat_returns.glass', 'rb') as fp:
-        for page in read_path(fp, b'strat_returns/last_trade.SPY')['names']:
-            a = read_path(fp, b'strat_returns/last_trade.SPY/%s/vals'%page)
-            b = read_path(fp, b'strat_returns/returns.SPY/%s/vals'%page)
-            print(a)
-            #print(b)
-    print(time.time()-s)
-#    s = time.time()
-#    with open('prices5s.glass', 'rb') as fp:
-#        for page in read_path(fp, b'prices/open')['names']:
-#            a = read_path(fp, b'prices/date/%s/idx/pct'%page)
-#            b = read_path(fp, b'prices/close/%s/idx/pct'%page)
-#            #b = read_path(fp, b'prices/open/%s/vals'%page)
-#            #c = read_path(fp, b'prices/close/%s/vals'%page)
-#            #print(a[0], a[-1])
-#            print(a)
-#    print(time.time()-s)
-    return
-    path = 'test.glass'
-    vec1 = np.random.rand(1000000)
-    vec2 = np.random.rand(1000000)
-    #vals = np.array(200000*[3230,123981,.3498,.4,.99], dtype=np.float32)
-    s = time.time()
-    with open(path, 'wb+') as fp:
-        init_glassdb(fp)
-        create_table(fp, b'test-table', [b'col1',b'col2'])
-        insert_table_page(fp, b'test-table', 0, {b'col1': vec1, b'col2': vec2})
-    print(time.time()-s)
-    s = time.time()
-
-    with open(path, 'rb') as fp:
-        col1 = read_path(fp, b'test-table/col1/\0\0\0\0pg/vals')
-        pct = read_path(fp, b'test-table/col1/\0\0\0\0pg/idx/pct')
-    print(time.time()-s)
-    print(col1)
-    print(len(col1))
-    #print(pct)
-
-if __name__ == '__main__':
-    main()
+        rec_i = dir_rec['names'].index(name)
+        if dir_rec['types'][rec_i] == type_order.index('dir'):
+            return dir_rec['offsets'][rec_i]
+        else:
+            raise RuntimeError('{} is not a directory'.format(name))
 

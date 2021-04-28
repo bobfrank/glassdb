@@ -3,7 +3,8 @@ import json
 import csv
 import time
 import numpy as np
-# TODO also support pq files?
+import pyarrow.parquet as pq
+
 
 def jsonl_flatten(x, prefix=None):
     res = {}
@@ -22,7 +23,8 @@ def jsonl_flatten(x, prefix=None):
                 res['{}.{}'.format(prefix,k)] = v
     return res
 
-from storage import create_table, insert_table_page, init_glassdb, TextVec
+from .storage import init_glassdb, TextVec
+from .table import create_table, insert_table_page
 
 def add_page(fp_out, table_name, cols, rows, page_i):
     col_names = list(cols)
@@ -108,42 +110,64 @@ def try_float(x):
 def try_date(x):
     return False
 def import_sqlite(fp, conn):
-    cur = conn.cursor()
-    limit = 1000000
-    for table, in list(cur.execute("select name from sqlite_master where type='table';")):
-        #print(table)
-        i = 0
-        while True:
-            #print(i*limit)
-            cur.execute('SELECT * FROM {} LIMIT {} OFFSET {}'.format(table, limit, i*limit))
-            header = [col[0].encode('utf-8') for col in cur.description]
-            if i == 0:
-                create_table(fp, table.encode('utf-8'), header)
-            rows = list(cur)
-            if len(rows) == 0:
-                break
-            table_page = dict((col, [row[k].encode('utf-8') if isinstance(row[k],str) else row[k] for row in rows]) for k,col in enumerate(header))
-            for k, col in enumerate(header):
-                can_int = True
-                can_float = True
-                can_date = True
-                for r in range(min(len(rows),10)):
-                    if not try_int(rows[r][k]):
-                        can_int = False
-                    if not try_float(rows[r][k]):
-                        can_float = False
-                    if not try_date(rows[r][k]):
-                        can_date = False
-                if can_int:
-                    table_page[col] = np.array(table_page[col], dtype=np.int64)
-                elif can_float:
-                    table_page[col] = np.array(table_page[col], dtype=np.float64)
-                elif can_date:
-                    table_page[col] = np.array(table_page[col], dtype=np.uint64)
-                else:
-                    table_page[col] = TextVec.fromlist(table_page[col])
-            insert_table_page(fp, table.encode('utf-8'), i, table_page, seed=1987)
-            i += 1
+    with sqlite3.connect(path) as conn:
+        cur = conn.cursor()
+        limit = 1000000
+        for table, in list(cur.execute("select name from sqlite_master where type='table';")):
+            #print(table)
+            i = 0
+            while True:
+                #print(i*limit)
+                cur.execute('SELECT * FROM {} LIMIT {} OFFSET {}'.format(table, limit, i*limit))
+                header = [col[0].encode('utf-8') for col in cur.description]
+                if i == 0:
+                    create_table(fp, table.encode('utf-8'), header)
+                rows = list(cur)
+                if len(rows) == 0:
+                    break
+                table_page = dict((col, [row[k].encode('utf-8') if isinstance(row[k],str) else row[k] for row in rows]) for k,col in enumerate(header))
+                for k, col in enumerate(header):
+                    can_int = True
+                    can_float = True
+                    can_date = True
+                    for r in range(min(len(rows),10)):
+                        if not try_int(rows[r][k]):
+                            can_int = False
+                        if not try_float(rows[r][k]):
+                            can_float = False
+                        if not try_date(rows[r][k]):
+                            can_date = False
+                    if can_int:
+                        table_page[col] = np.array(table_page[col], dtype=np.int64)
+                    elif can_float:
+                        table_page[col] = np.array(table_page[col], dtype=np.float64)
+                    elif can_date:
+                        table_page[col] = np.array(table_page[col], dtype=np.uint64)
+                    else:
+                        table_page[col] = TextVec.fromlist(table_page[col])
+                insert_table_page(fp, table.encode('utf-8'), i, table_page, seed=1987)
+                i += 1
+
+def import_parquet(fp_out, path, table_name):
+    table = pq.read_table(path)
+    create_table(fp_out, table_name.encode('utf-8'), [col.encode('utf-8') for col in table.column_names])
+    page_i = 0
+    while True:
+        table_page = {}
+        for i,column_name in enumerate(table.column_names):
+            col = table.columns[i]
+            if page_i >= len(col.chunks):
+                continue
+            col_page = col.chunks[page_i]
+            if col_page.type.equals('string'):
+                texts = [x.encode('utf-8') for x in col_page.to_pylist()]
+                table_page[column_name.encode('utf-8')] = TextVec.fromlist([x.encode('utf-8') for x in col_page.to_pylist()])
+            else:
+                table_page[column_name.encode('utf-8')] = col_page.to_numpy()
+        if len(table_page) == 0:
+            break
+        insert_table_page(fp_out, table_name.encode('utf-8'), page_i, table_page, seed=1987)
+        page_i += 1
 
 def main():
     with open('strat_returns.glass','wb+') as fp_out:
