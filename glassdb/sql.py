@@ -1,5 +1,6 @@
 import ply.lex # sudo pip3 install ply
 import ply.yacc
+# TODO fix this grammar, seems wrong based on autocomplete...
 
 keywords = set([
     'NULL','CURRENT_TIME','CURRENT_DATE','CURRENT_TIMESTAMP','EXISTS','NOT',
@@ -43,8 +44,8 @@ t_DOLLAR = r'\$'
 t_QUESTION = r'\?'
 t_PLUS = r'\+'
 t_MINUS = r'-'
-r_TILDE = r'~'
-r_STRING_CONCAT = r'\|\|'
+t_TILDE = r'~'
+t_STRING_CONCAT = r'\|\|'
 t_DIV = r'/'
 t_MOD = r'%'
 t_NE = r'(!=|<>)'
@@ -177,7 +178,7 @@ def p_select_distinct_normal(p):
 
 
 def p_from_join(p):
-    'from : from join_clause table_or_subquery'
+    'from : table_or_subquery join_clause'
     p[0] = ('join',p[2],p[1],p[3])
 
 def p_from_next(p):
@@ -375,16 +376,12 @@ def p_expression_isnull(p):
     'expression : expr_binary_or ISNULL'
     p[0] = ('isnull',p[1])
 
-def p_expression_not_null(p):
-    'expression : expr_binary_or NOT NULL'
-    p[0] = ('notnull',p[1])
-
 def p_expression_notnull(p):
     'expression : expr_binary_or NOTNULL'
     p[0] = ('notnull',p[1])
 
 def p_expression_is(p):
-    'expression : expr_binary_or IS expr_binary_or'
+    'expression : expr_binary_or IS expression'
     p[0] = ('is',p[1],p[3])
 
 def p_expression_base(p):
@@ -433,9 +430,17 @@ def p_expr_binary_streq_in(p):
     'expr_binary_streq : expr_binary_ineq IN expr_binary_streq'
     p[0] = ('in',p[1],p[3])
 
+def p_expr_binary_streq_notin(p):
+    'expr_binary_streq : expr_binary_ineq NOT IN expr_binary_streq'
+    p[0] = ('notin',p[1],p[3])
+
 def p_expr_binary_streq_like(p):
     'expr_binary_streq : expr_binary_ineq LIKE expr_binary_streq'
     p[0] = ('like',p[1],p[3])
+
+def p_expr_binary_streq_notlike(p):
+    'expr_binary_streq : expr_binary_ineq NOT LIKE expr_binary_streq'
+    p[0] = ('notlike',p[1],p[3])
 
 def p_expr_binary_streq_glob(p):
     'expr_binary_streq : expr_binary_ineq GLOB expr_binary_streq'
@@ -497,11 +502,11 @@ def p_expr_binary_bitwise_next(p):
 
 
 def p_expr_binary_sum_plus(p):
-    'expr_binary_sum : expr_binary_sum PLUS expr_binary_prod'
+    'expr_binary_sum : expr_binary_prod PLUS expr_binary_sum'
     p[0] = ('+',p[1],p[3])
 
 def p_expr_binary_sum_minus(p):
-    'expr_binary_sum : expr_binary_sum MINUS expr_binary_prod'
+    'expr_binary_sum : expr_binary_prod MINUS expr_binary_sum'
     p[0] = ('-',p[1],p[3])
 
 def p_expr_binary_sum_next(p):
@@ -510,15 +515,15 @@ def p_expr_binary_sum_next(p):
 
 
 def p_expr_binary_prod_asterisk(p):
-    'expr_binary_prod : expr_binary_prod ASTERISK expr_binary_stradd'
+    'expr_binary_prod : expr_binary_stradd ASTERISK expr_binary_prod'
     p[0] = ('*',p[1],p[3])
 
 def p_expr_binary_prod_div(p):
-    'expr_binary_prod : expr_binary_prod DIV expr_binary_stradd'
+    'expr_binary_prod : expr_binary_stradd DIV expr_binary_prod'
     p[0] = ('/',p[1],p[3])
 
 def p_expr_binary_prod_mod(p):
-    'expr_binary_prod : expr_binary_prod MOD expr_binary_stradd'
+    'expr_binary_prod : expr_binary_stradd MOD expr_binary_prod'
     p[0] = ('%',p[1],p[3])
 
 def p_expr_binary_prod_next(p):
@@ -581,7 +586,7 @@ def p_expr_core_tc(p):
 
 def p_expr_core_id(p):
     'expr_core : IDENTIFIER'
-    p[0] = p[1]
+    p[0] = ('.',p[1])
 
 # TODO TOP, DISTINCT, etc
 def p_expr_core_func(p):
@@ -614,7 +619,7 @@ def p_literal_real(p):
 
 def p_literal_str(p):
     'literal : STRING'
-    p[0] = p[1]
+    p[0] = p[1][1:-1].encode('utf-8')
 
 def p_literal_null(p):
     'literal : NULL'
@@ -665,12 +670,72 @@ parser = ply.yacc.yacc(tabmodule='sqlparsetab')
 def _sql(text):
     return parser.parse(text, lexer)
 
-# TODO fix this -- WARNING: 117 shift/reduce conflicts
+def sql_completion(text):
+    from .sqlparsetab import _lr_action
+    import string
+    import re
+    lexer.input(text)
+    tokens = []
+    while True:
+        tok = lexer.token()
+        if not tok:
+            break
+        tokens.append(tok)
+    state = 0
+    available_tokens = []
+    started = ''
+    next_ok = False
+    for k, tok in enumerate(tokens):
+        if k == len(tokens)-1:
+            available_tokens = [key for key in _lr_action[state].keys()]
+            started = tok.value
+        if tok.type in _lr_action[state]:
+            state = abs(_lr_action[state][tok.type])
+            if k == len(tokens)-1:
+                next_ok = True
+    available_tokens_next = list(_lr_action[state].keys()) if next_ok else []
+    # TODO would be nice to know if the identifier is a column or a table name
+    completion = {}
+    for av, is_next in [(available_tokens,False), (available_tokens_next,True)]:
+        if is_next:
+            prev_token = tokens[-1].type
+        else:
+            if len(tokens) > 1:
+                prev_token = tokens[-2].type
+            else:
+                prev_token = None
+        for tok in av:
+            if tok != '$end':
+                if tok in keywords:
+                    if is_next:
+                        completion[tok] = (is_next, False, [tok])
+                    else:
+                        if tok.startswith(started.upper()):
+                            completion[tok] = (is_next, False, [tok])
+                else:
+                    regex = globals()['t_%s'%tok]
+                    if not isinstance(regex, str):
+                        regex = regex.__doc__
+                    tok_re = re.compile(regex)
+                    available_chars = []
+                    for c in string.printable:
+                        if is_next:
+                            if tok_re.fullmatch(c):
+                                available_chars.append(c)
+                        else:
+                            if tok_re.fullmatch(started + c):
+                                available_chars.append(started + c)
+                    if len(available_chars):
+                        is_table = tok == 'IDENTIFIER' and prev_token in ['FROM','JOIN']
+                        completion[tok] = (is_next, is_table, available_chars)
+    return completion
+
 
 if __name__ == '__main__':
     import time
     s = time.time()
     #pt = _sql('select count(*), test,* from magic left join partial on l=r where a=:a group by xyz order by other')
-    pt = _sql('select count(*), test.* from magic where a=:a group by xyz order by other')
-    print('time',time.time()-s)
-    print(pt)
+    sql_completion('select a from')
+    #pt = _sql('select count(*), test.* from magic where a=:a group by xyz order by other')
+    #print('time',time.time()-s)
+    #print(pt)
